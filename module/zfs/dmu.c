@@ -77,15 +77,6 @@ static int zfs_nopwrite_enabled = 1;
 static uint_t zfs_per_txg_dirty_frees_percent = 30;
 
 /*
- * Enable/disable forcing txg sync when dirty checking for holes with lseek().
- * By default this is enabled to ensure accurate hole reporting, it can result
- * in a significant performance penalty for lseek(SEEK_HOLE) heavy workloads.
- * Disabling this option will result in holes never being reported in dirty
- * files which is always safe.
- */
-static int zfs_dmu_offset_next_sync = 1;
-
-/*
  * Limit the amount we can prefetch with one call to this amount.  This
  * helps to limit the amount of memory that can be used by prefetching.
  * Larger objects should be prefetched a bit at a time.
@@ -2521,60 +2512,24 @@ dmu_write_policy(objset_t *os, dnode_t *dn, int level, int wp, zio_prop_t *zp)
 }
 
 /*
- * Reports the location of data and holes in an object.  In order to
- * accurately report holes all dirty data must be synced to disk.  This
- * causes extremely poor performance when seeking for holes in a dirty file.
- * As a compromise, only provide hole data when the dnode is clean.  When
- * a dnode is dirty report the dnode as having no holes by returning EBUSY
- * which is always safe to do.
+ * Reports the location of data and holes in an object.  Dirty blocks and
+ * pending holes are reported accurately.  However, a dirty data block may
+ * become a hole during sync if zio detects that it is all zeros.
  */
 int
 dmu_offset_next(objset_t *os, uint64_t object, boolean_t hole, uint64_t *off)
 {
 	dnode_t *dn;
-	uint64_t txg, maxtxg = 0;
 	int err;
 
-restart:
 	err = dnode_hold(os, object, FTAG, &dn);
 	if (err)
 		return (err);
 
-	rw_enter(&dn->dn_struct_rwlock, RW_READER);
+	err = dnode_next_offset(dn,
+	    DNODE_FIND_DIRTY | (hole ? DNODE_FIND_HOLE : 0),
+	    off, 1, 1, 0);
 
-	if (dnode_is_dirty(dn)) {
-		/*
-		 * If the zfs_dmu_offset_next_sync module option is enabled
-		 * then hole reporting has been requested.  Dirty dnodes
-		 * must be synced to disk to accurately report holes.
-		 *
-		 * Provided a RL_READER rangelock spanning 0-UINT64_MAX is
-		 * held by the caller only limited restarts will be required.
-		 * We tolerate callers which do not hold the rangelock by
-		 * returning EBUSY and not reporting holes after at most
-		 * TXG_CONCURRENT_STATES (3) restarts.
-		 */
-		if (zfs_dmu_offset_next_sync) {
-			rw_exit(&dn->dn_struct_rwlock);
-			dnode_rele(dn, FTAG);
-
-			if (maxtxg == 0) {
-				txg = spa_last_synced_txg(dmu_objset_spa(os));
-				maxtxg = txg + TXG_CONCURRENT_STATES;
-			} else if (txg >= maxtxg)
-				return (SET_ERROR(EBUSY));
-
-			txg_wait_synced(dmu_objset_pool(os), ++txg);
-			goto restart;
-		}
-
-		err = SET_ERROR(EBUSY);
-	} else {
-		err = dnode_next_offset(dn, DNODE_FIND_HAVELOCK |
-		    (hole ? DNODE_FIND_HOLE : 0), off, 1, 1, 0);
-	}
-
-	rw_exit(&dn->dn_struct_rwlock);
 	dnode_rele(dn, FTAG);
 
 	return (err);
@@ -2979,9 +2934,6 @@ ZFS_MODULE_PARAM(zfs, zfs_, nopwrite_enabled, INT, ZMOD_RW,
 
 ZFS_MODULE_PARAM(zfs, zfs_, per_txg_dirty_frees_percent, UINT, ZMOD_RW,
 	"Percentage of dirtied blocks from frees in one TXG");
-
-ZFS_MODULE_PARAM(zfs, zfs_, dmu_offset_next_sync, INT, ZMOD_RW,
-	"Enable forcing txg sync to find holes");
 
 ZFS_MODULE_PARAM(zfs, , dmu_prefetch_max, UINT, ZMOD_RW,
 	"Limit one prefetch call to this size");

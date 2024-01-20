@@ -75,6 +75,9 @@ scripts_zfs_tests_bin_PROGRAMS += %D%/mkbusy %D%/mkfile %D%/mkfiles %D%/mktree
 scripts_zfs_tests_bin_PROGRAMS += \
 	%D%/mmap_exec %D%/mmap_ftruncate %D%/mmap_seek \
 	%D%/mmap_sync %D%/mmapwrite %D%/readmmap %D%/mmap_write_sync
+%C%_mmap_seek_LDADD = \
+	libzfs_core.la \
+	libnvpair.la
 %C%_mmapwrite_LDADD = -lpthread
 
 if WANT_MMAP_LIBAIO

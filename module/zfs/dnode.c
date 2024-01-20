@@ -1823,23 +1823,6 @@ dnode_try_claim(objset_t *os, uint64_t object, int slots)
 	    slots, NULL, NULL));
 }
 
-/*
- * Test if the dnode is dirty, or carrying uncommitted records.
- *
- * dn_dirtycnt is the number of txgs this dnode is dirty on. It's incremented
- * in dnode_setdirty() the first time the dnode is dirtied on a txg, and
- * decremented in either dnode_rele_task() or userquota_updates_task() when the
- * txg is synced out.
- */
-boolean_t
-dnode_is_dirty(dnode_t *dn)
-{
-	mutex_enter(&dn->dn_mtx);
-	boolean_t dirty = (dn->dn_dirtycnt != 0);
-	mutex_exit(&dn->dn_mtx);
-	return (dirty);
-}
-
 void
 dnode_setdirty(dnode_t *dn, dmu_tx_t *tx)
 {
