@@ -2109,76 +2109,6 @@ dnode_dirty_l1(dnode_t *dn, uint64_t l1blkid, dmu_tx_t *tx)
 	}
 }
 
-/*
- * Dirty all the in-core level-1 dbufs in the range specified by start_blkid
- * and end_blkid.
- */
-static void
-dnode_dirty_l1range(dnode_t *dn, uint64_t start_blkid, uint64_t end_blkid,
-    dmu_tx_t *tx)
-{
-	dmu_buf_impl_t *db_search;
-	dmu_buf_impl_t *db;
-	avl_index_t where;
-
-	db_search = kmem_zalloc(sizeof (dmu_buf_impl_t), KM_SLEEP);
-
-	mutex_enter(&dn->dn_dbufs_mtx);
-
-	db_search->db_level = 1;
-	db_search->db_blkid = start_blkid + 1;
-	db_search->db_state = DB_SEARCH;
-	for (;;) {
-
-		db = avl_find(&dn->dn_dbufs, db_search, &where);
-		if (db == NULL)
-			db = avl_nearest(&dn->dn_dbufs, where, AVL_AFTER);
-
-		if (db == NULL || db->db_level != 1 ||
-		    db->db_blkid >= end_blkid) {
-			break;
-		}
-
-		/*
-		 * Setup the next blkid we want to search for.
-		 */
-		db_search->db_blkid = db->db_blkid + 1;
-		ASSERT3U(db->db_blkid, >=, start_blkid);
-
-		/*
-		 * If the dbuf transitions to DB_EVICTING while we're trying
-		 * to dirty it, then we will be unable to discover it in
-		 * the dbuf hash table. This will result in a call to
-		 * dbuf_create() which needs to acquire the dn_dbufs_mtx
-		 * lock. To avoid a deadlock, we drop the lock before
-		 * dirtying the level-1 dbuf.
-		 */
-		mutex_exit(&dn->dn_dbufs_mtx);
-		dnode_dirty_l1(dn, db->db_blkid, tx);
-		mutex_enter(&dn->dn_dbufs_mtx);
-	}
-
-#ifdef ZFS_DEBUG
-	/*
-	 * Walk all the in-core level-1 dbufs and verify they have been dirtied.
-	 */
-	db_search->db_level = 1;
-	db_search->db_blkid = start_blkid + 1;
-	db_search->db_state = DB_SEARCH;
-	db = avl_find(&dn->dn_dbufs, db_search, &where);
-	if (db == NULL)
-		db = avl_nearest(&dn->dn_dbufs, where, AVL_AFTER);
-	for (; db != NULL; db = AVL_NEXT(&dn->dn_dbufs, db)) {
-		if (db->db_level != 1 || db->db_blkid >= end_blkid)
-			break;
-		if (db->db_state != DB_EVICTING)
-			ASSERT(db->db_dirtycnt > 0);
-	}
-#endif
-	kmem_free(db_search, sizeof (dmu_buf_impl_t));
-	mutex_exit(&dn->dn_dbufs_mtx);
-}
-
 void
 dnode_set_dirtyctx(dnode_t *dn, dmu_tx_t *tx, const void *tag)
 {
@@ -2362,8 +2292,6 @@ dnode_free_range(dnode_t *dn, uint64_t off, uint64_t len, dmu_tx_t *tx)
 		if (last != first)
 			dnode_dirty_l1(dn, last, tx);
 
-		dnode_dirty_l1range(dn, first, last, tx);
-
 		int shift = dn->dn_datablkshift + dn->dn_indblkshift -
 		    SPA_BLKPTRSHIFT;
 		for (uint64_t i = first + 1; i < last; i++) {
@@ -2372,10 +2300,16 @@ dnode_free_range(dnode_t *dn, uint64_t off, uint64_t len, dmu_tx_t *tx)
 			 * level-1 indirect block at or after i.  Note
 			 * that dnode_next_offset() operates in terms of
 			 * level-0-equivalent bytes.
+			 * N.B. this uses minlvl=1 to avoid redirtying L1s
+			 * freed in prior txgs as minlvl=1 checks L0s and skips
+			 * dirty L1s containing no L0 BPs or only freed L0s.
+			 * minlvl=2 would also work, but that would then match
+			 * every dirty L1 pointer unconditionally.
 			 */
 			uint64_t ibyte = i << shift;
-			int err = dnode_next_offset(dn, DNODE_FIND_HAVELOCK,
-			    &ibyte, 2, 1, 0);
+			int err = dnode_next_offset(
+			    dn, DNODE_FIND_HAVELOCK | DNODE_FIND_DIRTY,
+			    &ibyte, 1, 1, 0);
 			i = ibyte >> shift;
 			if (i >= last)
 				break;
