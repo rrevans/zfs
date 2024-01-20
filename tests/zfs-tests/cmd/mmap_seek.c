@@ -34,6 +34,8 @@
 #ifdef __linux__
 #include <linux/fs.h>
 #endif
+#include <libnvpair.h>
+#include <libzfs_core.h>
 
 /* some older uClibc's lack the defines, so we'll manually define them */
 #ifdef	__UCLIBC__
@@ -67,6 +69,18 @@ seek_hole(int fd, off_t offset, off_t expected)
 	}
 }
 
+static void
+sync_pool(const char *pool_name)
+{
+	nvlist_t *innvl = fnvlist_alloc();
+	fnvlist_add_boolean_value(innvl, "force", B_TRUE);
+	if (lzc_sync(pool_name, innvl, NULL) != 0) {
+		perror("lzc_sync");
+		exit(2);
+	}
+	nvlist_free(innvl);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -75,11 +89,13 @@ main(int argc, char **argv)
 	char *buf = NULL;
 	int err;
 
-	if (argc != 4) {
+	if (argc != 5) {
 		(void) printf("usage: %s <file name> <file size> "
-		    "<block size>\n", argv[0]);
+		    "<block size> <pool name>\n", argv[0]);
 		exit(1);
 	}
+
+	(void) libzfs_core_init();
 
 	int fd = open(file_path, O_RDWR | O_CREAT, 0666);
 	if (fd == -1) {
@@ -90,6 +106,7 @@ main(int argc, char **argv)
 
 	off_t file_size = atoi(argv[2]);
 	off_t block_size = atoi(argv[3]);
+	const char *pool_name = argv[4];
 
 	if (block_size * 2 > file_size) {
 		(void) fprintf(stderr, "file size must be at least "
@@ -143,6 +160,12 @@ main(int argc, char **argv)
 
 	/* Punch a hole (required compression be enabled). */
 	memset(buf + block_size, 0, block_size);
+	err = msync(buf, file_size, MS_SYNC);
+	if (err == -1) {
+		perror("msync");
+		exit(2);
+	}
+	sync_pool(pool_name);
 	seek_data(fd, 0, 0);
 	seek_data(fd, block_size, 2 * block_size);
 	seek_hole(fd, 0, block_size);
