@@ -55,6 +55,7 @@ extern "C" {
 #define	DNODE_FIND_HOLE		1
 #define	DNODE_FIND_BACKWARDS	2
 #define	DNODE_FIND_HAVELOCK	4
+#define	DNODE_FIND_DIRTY	8
 
 /*
  * Fixed constants.

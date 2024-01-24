@@ -2519,11 +2519,48 @@ dnode_diduse_space(dnode_t *dn, int64_t delta)
 }
 
 /*
- * Scans a block at the indicated "level" looking for a hole or data,
- * depending on 'flags'.
+ * Tests if a data or indirect block is dirty in any pending txg.
+ * For indirect blocks, tests if the block is dirty in any txg.
+ * For L0 blocks, also tests if the block has dirty data in open context.
+ */
+static boolean_t
+dnode_block_dirty(dnode_t *dn, int lvl, uint64_t blkid)
+{
+	dmu_buf_impl_t *db;
+	boolean_t result = B_FALSE;
+
+	db = dbuf_find(dn->dn_objset, dn->dn_object, lvl, blkid, NULL);
+	if (db == NULL || db->db_dirtycnt == 0)
+		goto out;
+
+	/* dirty but freed L0 blocks are treated as holes */
+	result = lvl > 0 ||
+	    db->db_state == DB_CACHED ||
+	    db->db_state == DB_FILL ||
+	    db->db_state == DB_NOFILL;
+
+out:
+	if (db != NULL)
+		mutex_exit(&db->db_mtx);
+
+	return (result);
+}
+
+/*
+ * Scans a block at the indicated "level" looking for a hole, data, or a dirty
+ * indirect block at level - 1 depending on 'flags'.
  *
- * If level > 0, then we are scanning an indirect block looking at its
- * pointers.  If level == 0, then we are looking at a block of dnodes.
+ * If level > 0, then we are scanning an indirect block searching for matches
+ * at level - 1.  If level == 0, then we are looking at a block of dnodes.
+ *
+ * When flags & DNODE_FIND_DIRTY, this also checks for dirty dbufs at level - 1
+ * if this block also has a dirty dbuf (if not, all BP's are up-to-date and
+ * it's guaranteed that there are no dirty dbufs below this block in the tree).
+ * This allows a consistent search w.r.t. open context (with the caveat that
+ * sync context may introduce holes in the background as it compresses blocks).
+ * Any pending leaf data (or hole) matches as does any dirty indirect block.
+ * This allows finding dirty L0 blocks in sparse objects very efficiently since
+ * dirtying an L0 block also dirties all indirect blocks up to the dnode.
  *
  * If we don't find what we are looking for in the block, we return ESRCH.
  * Otherwise, return with *offset pointing to the beginning (if searching
@@ -2547,23 +2584,60 @@ dnode_next_offset_level(dnode_t *dn, int flags, uint64_t *offset,
 {
 	dmu_buf_impl_t *db = NULL;
 	void *data = NULL;
-	uint64_t epbs = dn->dn_phys->dn_indblkshift - SPA_BLKPTRSHIFT;
+	uint64_t nbps = 0;
+	uint64_t epbs = dn->dn_indblkshift - SPA_BLKPTRSHIFT;
 	uint64_t epb = 1ULL << epbs;
 	uint64_t minfill, maxfill;
-	boolean_t hole;
+	boolean_t hole, dirty;
 	int i, inc, error, span;
 
 	ASSERT(RW_LOCK_HELD(&dn->dn_struct_rwlock));
 	ASSERT3U(dn->dn_nlevels, >, 0);
 
 	hole = ((flags & DNODE_FIND_HOLE) != 0);
+	dirty = ((flags & DNODE_FIND_DIRTY) != 0);
 	inc = (flags & DNODE_FIND_BACKWARDS) ? -1 : 1;
 	ASSERT(txg == 0 || !hole);
 
-	if (lvl == dn->dn_phys->dn_nlevels) {
+	/*
+	 * During indirection growth we may visit new levels not yet on-disk.
+	 * Finding the BPs on-disk for indirect blocks needs special handling.
+	 * This mirrors dnode_set_nlevels_impl and dnode_increase_indirection.
+	 *
+	 * Indirection growth details:
+	 * - dn->dn_nlevels is the number of levels that will exist after sync.
+	 * - dn->dn_phys->dn_nlevels is the last synced number of levels.
+	 *   This is zero if the object has never been synced.
+	 * - nbps below is the number of on-disk BP's we have before growing
+	 * - epb is the number of BP's we will have after growing
+	 *
+	 * If no growth is pending, dn->dn_nlevels == dn->dn_phys->dn_nlevels
+	 * and nbps == ebp (1ULL << epbs or dn->dn_phys->dn_nblkptr).
+	 *
+	 * If growth is pending, dn->dn_nlevels > dn->dn_phys->dn_nlevels and:
+	 * 1. For lvl == dn->dn_nlevels, no BPs exist on disk and will be stored
+	 *    in the dnode later, so nbps == 0 and epb = dn->dn_nblkptr.
+	 * 2. For dn->dn_phys->dn_nlevels < lvl < dn->dn_nlevels, no BPs exist
+	 *    on disk and will be stored in newly allocated indirect blocks,
+	 *    so nbps = epb = 1ULL << epbs.
+	 * 3. For 0 < lvl == dn->dn_phys->dn_nlevels and blkid == 0, BPs exist
+	 *    in the dnode and will be moved later to a new indirect block.
+	 *    So nbps = dn->dn_phys->dn_blkptr and epb = 1ULL << epbs.
+	 * 4. For 0 < lvl == dn->dn_phys->dn_nlevels and blkid > 0, no BPs exist
+	 *    on disk yet and will be stored in newly allocated indirect blocks.
+	 *    So nbps = 0 and epb = 1ULL << epbs.
+	 * 5. For 0 < lvl < dn->dn_phys->dn_nlevels, BPs may exist in indirect
+	 *    blocks (or be zero-filled if the indirect block is a hole).
+	 *    So nbps = epb = 1ULL << epbs.
+	 */
+	if (lvl == dn->dn_nlevels) {
 		error = 0;
-		epb = dn->dn_phys->dn_nblkptr;
-		data = dn->dn_phys->dn_blkptr;
+		epb = dn->dn_nblkptr;
+		if (lvl == dn->dn_phys->dn_nlevels) {
+			/* No pending indirection growth case. */
+			nbps = dn->dn_phys->dn_nblkptr;
+			data = dn->dn_phys->dn_blkptr;
+		}
 	} else {
 		uint64_t blkid = dbuf_whichblock(dn, lvl, *offset);
 		error = dbuf_hold_impl(dn, lvl, blkid, TRUE, FALSE, FTAG, &db);
@@ -2573,26 +2647,44 @@ dnode_next_offset_level(dnode_t *dn, int flags, uint64_t *offset,
 			if (hole)
 				return (0);
 			/*
-			 * This can only happen when we are searching up
-			 * the block tree for data.  We don't really need to
-			 * adjust the offset, as we will just end up looking
-			 * at the pointer to this block in its parent, and its
-			 * going to be unallocated, so we will skip over it.
+			 * This typically happens when we are searching up
+			 * the block tree for data, but also happens from open
+			 * context if sync freed this block. In both cases,
+			 * dnode_next_offset will adjust *offset and recurse up.
 			 */
 			return (SET_ERROR(ESRCH));
 		}
-		error = dbuf_read(db, NULL,
-		    DB_RF_CANFAIL | DB_RF_HAVESTRUCT |
-		    DB_RF_NO_DECRYPT | DB_RF_NOPREFETCH);
-		if (error) {
-			dbuf_rele(db, FTAG);
-			return (error);
+		if (lvl > 0 && lvl == dn->dn_phys->dn_nlevels && blkid == 0) {
+			/*
+			 * Pending indirection growth. This block's pointers are
+			 * stored in the dnode until sync grows the tree.
+			 */
+			nbps = dn->dn_phys->dn_nblkptr;
+			data = dn->dn_phys->dn_blkptr;
+		} else if (lvl == 0 || lvl < dn->dn_phys->dn_nlevels) {
+			/* block exists in the on-disk structure */
+			error = dbuf_read(db, NULL,
+			    DB_RF_CANFAIL | DB_RF_HAVESTRUCT |
+			    DB_RF_NO_DECRYPT | DB_RF_NOPREFETCH);
+			if (error) {
+				dbuf_rele(db, FTAG);
+				return (error);
+			}
+			nbps = epb;
+			data = db->db.db_data;
 		}
-		data = db->db.db_data;
+		if (dirty) {
+			/* skip child checks if this dbuf is not dirty */
+			mutex_enter(&db->db_mtx);
+			if (db->db_dirtycnt == 0)
+				dirty = B_FALSE;
+			mutex_exit(&db->db_mtx);
+		}
 		rw_enter(&db->db_rwlock, RW_READER);
 	}
 
-	if (db != NULL && txg != 0 && (db->db_blkptr == NULL ||
+	if (!dirty &&
+	    db != NULL && txg != 0 && (db->db_blkptr == NULL ||
 	    BP_GET_LOGICAL_BIRTH(db->db_blkptr) <= txg ||
 	    BP_IS_HOLE(db->db_blkptr))) {
 		/*
@@ -2603,6 +2695,7 @@ dnode_next_offset_level(dnode_t *dn, int flags, uint64_t *offset,
 	} else if (lvl == 0) {
 		dnode_phys_t *dnp = data;
 
+		ASSERT(dnp != NULL);
 		ASSERT(dn->dn_type == DMU_OT_DNODE);
 		ASSERT(!(flags & DNODE_FIND_BACKWARDS));
 		ASSERT3U(P2PHASE(*offset, DNODE_SHIFT), ==, 0);
@@ -2626,6 +2719,7 @@ dnode_next_offset_level(dnode_t *dn, int flags, uint64_t *offset,
 		span = (lvl - 1) * epbs + dn->dn_datablkshift;
 		minfill = 0;
 		maxfill = blkfill << ((lvl - 1) * epbs);
+		ASSERT(bp != NULL || nbps == 0);
 		ASSERT3S(span, >, 0);
 		ASSERT3U(maxfill, >, 0);
 
@@ -2650,13 +2744,34 @@ dnode_next_offset_level(dnode_t *dn, int flags, uint64_t *offset,
 			blkid = MIN(epb - 1, blkid);
 
 		for (i = BF64_GET(blkid, 0, epbs);
-		    i >= 0 && i < epb; i += inc) {
-			if (BP_GET_FILL(&bp[i]) >= minfill &&
+		    i >= 0 && i < epb;
+		    i += inc, blkid += (inc > 0 || blkid > 0) ? inc : 0) {
+			/* check for dirty indirect or data block */
+			if (dirty) {
+				if (dnode_block_dirty(dn, lvl - 1, blkid)) {
+					/* block exists or is dirty indirect */
+					if (hole && lvl == 1)
+						continue;
+					break;
+				}
+				if (lvl == 1 && dnode_block_freed(dn, blkid)) {
+					/* L0 block is freed in open context */
+					if (hole)
+						break;
+					continue;
+				}
+			}
+
+			/* check synced state for BPs on-disk */
+			if (i < nbps &&
+			    BP_GET_FILL(&bp[i]) >= minfill &&
 			    BP_GET_FILL(&bp[i]) <= maxfill &&
 			    (hole || BP_GET_LOGICAL_BIRTH(&bp[i]) > txg))
 				break;
-			if (inc > 0 || blkid > 0)
-				blkid += inc;
+
+			/* treat as hole if no on-disk BP and not dirty */
+			if (i >= nbps && hole)
+				break;
 		}
 
 		ASSERT(i >= 0 || inc < 0);
@@ -2718,6 +2833,17 @@ dnode_next_block(dnode_t *dn, boolean_t back, uint64_t *offset, int lvl)
  * DNODES_PER_BLOCK for the meta dnode, and some fraction of
  * DNODES_PER_BLOCK when searching for sparse regions thereof.
  *
+ * flags:
+ *      DNODE_FIND_HOLE       find holes instead of data
+ *      DNODE_FIND_BACKWARDS  search at decreasing offsets
+ *      DNODE_FIND_HAVELOCK   caller holds dn_struct_rwlock
+ *      DNODE_FIND_DIRTY      also search in-memory dbufs
+ *
+ * When DNODE_FIND_DIRTY is set, the behavior depends on minlvl:
+ *      If minlvl > 1, also matches all dirty indirect blocks at minlvl - 1.
+ *      If minlvl == 1, also matches pending not-yet-synced L0 data/holes.
+ *      If minlvl == 0, also matches dnodes in dirty metadnode blocks.
+ *
  * Examples:
  *
  * dnode_next_offset(dn, flags, offset, 1, 1, 0);
@@ -2742,11 +2868,12 @@ dnode_next_offset(dnode_t *dn, int flags, uint64_t *offset,
 	int lvl, maxlvl;
 	int error = 0;
 	boolean_t back = ((flags & DNODE_FIND_BACKWARDS) != 0);
+	boolean_t dirty = ((flags & DNODE_FIND_DIRTY) != 0);
 
 	if (!(flags & DNODE_FIND_HAVELOCK))
 		rw_enter(&dn->dn_struct_rwlock, RW_READER);
 
-	if (dn->dn_phys->dn_nlevels == 0) {
+	if (!dirty && dn->dn_phys->dn_nlevels == 0) {
 		error = SET_ERROR(ESRCH);
 		goto out;
 	}
@@ -2761,7 +2888,7 @@ dnode_next_offset(dnode_t *dn, int flags, uint64_t *offset,
 		goto out;
 	}
 
-	maxlvl = dn->dn_phys->dn_nlevels;
+	maxlvl = dirty ? dn->dn_nlevels : dn->dn_phys->dn_nlevels;
 
 	for (lvl = minlvl; lvl <= maxlvl; ) {
 		error = dnode_next_offset_level(dn,
