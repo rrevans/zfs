@@ -322,6 +322,13 @@ zpl_iter_read(struct kiocb *kiocb, struct iov_iter *to)
 	crhold(cr);
 	cookie = spl_fstrans_mark();
 
+#if defined(HAVE_FILEMAP_RANGE_HAS_PAGE)
+	if (zn_has_cached_data(ITOZ(filp->f_mapping->host), kiocb->ki_pos,
+	    kiocb->ki_pos + count - 1)) {
+		return (generic_file_read_iter(kiocb, to));
+	}
+#endif
+
 	int error = -zfs_read(ITOZ(filp->f_mapping->host), &uio,
 	    filp->f_flags | zfs_io_flags(kiocb), cr);
 
