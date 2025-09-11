@@ -346,6 +346,13 @@ usage(void)
 	    "\t\tsuch that the operation takes a minimum of supplied seconds\n"
 	    "\t\tto complete.\n"
 	    "\n"
+	    "\tzinject -E <seconds> [-a] [-m] [-f freq] [-l level] [-r range]\n"
+	    "\t\t[-T iotype] [-t type object | -b bookmark pool]\n"
+	    "\n"
+	    "\t\tInject pipeline ready stage delays for the given object path\n"
+	    "\t\t(data or dnode) or raw bookmark. Arguments other than -E are\n"
+	    "\t\tthe same as for injecting errors documented below."
+	    "\n"
 	    "\tzinject -I [-s <seconds> | -g <txgs>] pool\n"
 	    "\t\tCause the pool to stop writing blocks yet not\n"
 	    "\t\treport errors for a duration.  Simulates buggy hardware\n"
@@ -724,12 +731,15 @@ register_handler(const char *pool, int flags, zinject_record_t *record,
 	if (quiet) {
 		(void) printf("%llu\n", (u_longlong_t)zc.zc_guid);
 	} else {
+		boolean_t show_object = B_FALSE;
+		boolean_t show_iotype = B_FALSE;
 		(void) printf("Added handler %llu with the following "
 		    "properties:\n", (u_longlong_t)zc.zc_guid);
 		(void) printf("  pool: %s\n", pool);
 		if (record->zi_guid) {
 			(void) printf("  vdev: %llx\n",
 			    (u_longlong_t)record->zi_guid);
+			show_iotype = B_TRUE;
 		} else if (record->zi_func[0] != '\0') {
 			(void) printf("  panic function: %s\n",
 			    record->zi_func);
@@ -742,7 +752,18 @@ register_handler(const char *pool, int flags, zinject_record_t *record,
 		} else if (record->zi_timer > 0) {
 			(void) printf(" timer: %lld ms\n",
 			    (u_longlong_t)NSEC2MSEC(record->zi_timer));
+			if (record->zi_cmd == ZINJECT_DELAY_READY) {
+				show_object = B_TRUE;
+				show_iotype = B_TRUE;
+			}
 		} else {
+			show_object = B_TRUE;
+		}
+		if (show_iotype) {
+			(void) printf("iotype: %s\n",
+			    iotype_to_str(record->zi_iotype));
+		}
+		if (show_object) {
 			(void) printf("objset: %llu\n",
 			    (u_longlong_t)record->zi_objset);
 			(void) printf("object: %llu\n",
@@ -830,6 +851,25 @@ parse_frequency(const char *str, uint32_t *percent)
 	return (0);
 }
 
+static int
+parse_duration(const char *str, hrtime_t *time)
+{
+	double val;
+	char *end;
+
+	val = strtod(str, &end);
+	if (end == NULL || *end != '\0')
+		return (EINVAL);
+
+	/* valid range is [0, LLONG_MAX] */
+	val *= NANOSEC;
+	if (val < 0 || val > LLONG_MAX)
+		return (ERANGE);
+
+	*time = (hrtime_t)val;
+	return (0);
+}
+
 /*
  * This function converts a string specifier for DVAs into a bit mask.
  * The dva's provided by the user should be 0 indexed and separated by
@@ -910,6 +950,7 @@ main(int argc, char **argv)
 	int ret;
 	int flags = 0;
 	uint32_t dvas = 0;
+	hrtime_t ready_delay = -1;
 
 	if ((g_zfs = libzfs_init()) == NULL) {
 		(void) fprintf(stderr, "%s\n", libzfs_error_init(errno));
@@ -940,7 +981,7 @@ main(int argc, char **argv)
 	}
 
 	while ((c = getopt(argc, argv,
-	    ":aA:b:C:d:D:f:Fg:qhIc:t:T:l:mr:s:e:uL:p:P:")) != -1) {
+	    ":aA:b:C:d:D:E:f:Fg:qhIc:t:T:l:mr:s:e:uL:p:P:")) != -1) {
 		switch (c) {
 		case 'a':
 			flags |= ZINJECT_FLUSH_ARC;
@@ -1113,6 +1154,18 @@ main(int argc, char **argv)
 		case 'u':
 			flags |= ZINJECT_UNLOAD_SPA;
 			break;
+		case 'E':
+			ret = parse_duration(optarg, &ready_delay);
+			if (ret != 0) {
+				(void) fprintf(stderr, "invalid delay '%s': "
+				    "must be a positive duration\n", optarg);
+				usage();
+				libzfs_fini(g_zfs);
+				return (1);
+			}
+			record.zi_cmd = ZINJECT_DELAY_READY;
+			record.zi_timer = ready_delay;
+			break;
 		case 'L':
 			if ((label = name_to_type(optarg)) == TYPE_INVAL &&
 			    !LABEL_TYPE(type)) {
@@ -1150,7 +1203,7 @@ main(int argc, char **argv)
 		 */
 		if (raw != NULL || range != NULL || type != TYPE_INVAL ||
 		    level != 0 || record.zi_cmd != ZINJECT_UNINITIALIZED ||
-		    record.zi_freq > 0 || dvas != 0) {
+		    record.zi_freq > 0 || dvas != 0 || ready_delay >= 0) {
 			(void) fprintf(stderr, "cancel (-c) incompatible with "
 			    "any other options\n");
 			usage();
@@ -1186,7 +1239,7 @@ main(int argc, char **argv)
 		 */
 		if (raw != NULL || range != NULL || type != TYPE_INVAL ||
 		    level != 0 || record.zi_cmd != ZINJECT_UNINITIALIZED ||
-		    dvas != 0) {
+		    dvas != 0 || ready_delay >= 0) {
 			(void) fprintf(stderr, "device (-d) incompatible with "
 			    "data error injection\n");
 			usage();
@@ -1276,13 +1329,23 @@ main(int argc, char **argv)
 			return (1);
 		}
 
-		record.zi_cmd = ZINJECT_DATA_FAULT;
+		if (record.zi_cmd == ZINJECT_UNINITIALIZED) {
+			record.zi_cmd = ZINJECT_DATA_FAULT;
+			if (!error)
+				error = EIO;
+		} else if (error != 0) {
+			(void) fprintf(stderr, "error type -e incompatible "
+			    "with delay injection\n");
+			libzfs_fini(g_zfs);
+			return (1);
+		} else {
+			record.zi_iotype = io_type;
+		}
+
 		if (translate_raw(raw, &record) != 0) {
 			libzfs_fini(g_zfs);
 			return (1);
 		}
-		if (!error)
-			error = EIO;
 	} else if (record.zi_cmd == ZINJECT_PANIC) {
 		if (raw != NULL || range != NULL || type != TYPE_INVAL ||
 		    level != 0 || device != NULL || record.zi_freq > 0 ||
@@ -1410,6 +1473,13 @@ main(int argc, char **argv)
 			record.zi_dvas = dvas;
 		}
 
+		if (record.zi_cmd != ZINJECT_UNINITIALIZED && error != 0) {
+			(void) fprintf(stderr, "error type -e incompatible "
+			    "with delay injection\n");
+			libzfs_fini(g_zfs);
+			return (1);
+		}
+
 		if (error == EACCES) {
 			if (type != TYPE_DATA) {
 				(void) fprintf(stderr, "decryption errors "
@@ -1425,8 +1495,12 @@ main(int argc, char **argv)
 			 * not found.
 			 */
 			error = ECKSUM;
-		} else {
+		} else if (record.zi_cmd == ZINJECT_UNINITIALIZED) {
 			record.zi_cmd = ZINJECT_DATA_FAULT;
+			if (!error)
+				error = EIO;
+		} else {
+			record.zi_iotype = io_type;
 		}
 
 		if (translate_record(type, argv[0], range, level, &record, pool,
@@ -1434,8 +1508,6 @@ main(int argc, char **argv)
 			libzfs_fini(g_zfs);
 			return (1);
 		}
-		if (!error)
-			error = EIO;
 	}
 
 	/*

@@ -827,6 +827,45 @@ zio_handle_export_delay(spa_t *spa, hrtime_t elapsed)
 	zio_handle_pool_delay(spa, elapsed, ZINJECT_DELAY_EXPORT);
 }
 
+/*
+ * For testing, inject a delay before ready state
+ */
+void
+zio_handle_ready_delay(zio_t *zio)
+{
+	inject_handler_t *handler;
+	uint64_t delay = 0;
+
+	/*
+	 * Ignore I/O not associated with any logical data.
+	 */
+	if (zio->io_logical == NULL)
+		return;
+
+	rw_enter(&inject_lock, RW_READER);
+
+	for (handler = list_head(&inject_handlers); handler != NULL;
+	    handler = list_next(&inject_handlers, handler)) {
+		if (zio->io_spa != handler->zi_spa ||
+		    handler->zi_record.zi_cmd != ZINJECT_DELAY_READY)
+			continue;
+
+		/* If this handler matches, inject the delay */
+		if (zio_match_iotype(zio, handler->zi_record.zi_iotype) &&
+		    zio_match_handler(&zio->io_logical->io_bookmark,
+		    zio->io_bp ? BP_GET_TYPE(zio->io_bp) : DMU_OT_NONE,
+		    zio_match_dva(zio), &handler->zi_record, zio->io_error)) {
+			delay = handler->zi_record.zi_timer;
+			break;
+		}
+	}
+
+	rw_exit(&inject_lock);
+
+	if (delay)
+		zfs_sleep_until(gethrtime() + delay);
+}
+
 static int
 zio_calculate_range(const char *pool, zinject_record_t *record)
 {

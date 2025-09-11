@@ -5305,6 +5305,9 @@ zio_ready(zio_t *zio)
 		return (NULL);
 	}
 
+	if (zio_injection_enabled)
+		zio_handle_ready_delay(zio);
+
 	if (zio->io_ready) {
 		ASSERT(IO_IS_ALLOCATING(zio));
 		ASSERT(BP_GET_BIRTH(bp) == zio->io_txg ||
