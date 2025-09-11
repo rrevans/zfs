@@ -107,6 +107,7 @@
  * 	zinject
  * 	zinject <-a | -u pool>
  * 	zinject -c <id|all>
+ * 	zinject -w <state|0> [-W seconds]
  * 	zinject [-q] <-t type> [-f freq] [-u] [-a] [-m] [-e errno] [-l level]
  *	    [-r range] <object>
  * 	zinject [-f freq] [-a] [-m] [-u] -b objset:object:level:start:end pool
@@ -116,6 +117,11 @@
  *
  * The '-c' option will clear the given handler, or all handlers if 'all' is
  * specified.
+ *
+ * The '-w' flag waits until an injection event occurs. Wait calls accept a
+ * state value to ensure no events are lost. Use '-w 0 [-W 0]' initially and
+ * then pass the state value printed on stdout to subsequent wait calls.
+ * The optional '-W' flag sets an optional timeout in seconds.
  *
  * The '-e' option takes a string describing the errno to simulate.  This must
  * be one of 'io', 'checksum', 'decompress', or 'decrypt'.  In most cases this
@@ -132,12 +138,12 @@
  * The '-f' flag controls the frequency of errors injected, expressed as a
  * real number percentage between 0.0001 and 100.  The default is 100.
  *
- * The this form is responsible for actually injecting the handler into the
+ * The <object> form is responsible for actually injecting the handler into the
  * framework.  It takes the arguments described above, translates them to the
  * internal tuple using libzpool, and then issues an ioctl() to register the
  * handler.
  *
- * The final form can target a specific bookmark, regardless of whether a
+ * The '-b' form can target a specific bookmark, regardless of whether a
  * human-readable interface has been designed.  It allows developers to specify
  * a particular block by number.
  */
@@ -290,6 +296,13 @@ usage(void)
 	    "\n"
 	    "\t\tClear the particular record (if given a numeric ID), or\n"
 	    "\t\tall records if 'all' is specified.\n"
+	    "\n"
+	    "\tzinject -w <state|0> [-W seconds]\n"
+	    "\n"
+	    "\t\tWait for an injection event to occur.  The 'state' parameter\n"
+	    "\t\tshould be set to zero initially then the value printed to\n"
+	    "\t\tstdout after each call to synchronize with kernel state.\n"
+	    "\t\tThe optional timeout is specified in seconds.\n"
 	    "\n"
 	    "\tzinject -p <function name> pool\n"
 	    "\t\tInject a panic fault at the specified function. Only \n"
@@ -688,6 +701,33 @@ cancel_handler(int id)
 }
 
 /*
+ * Wait for a fault event
+ */
+static int
+wait_inject(uint64_t state, hrtime_t timeout)
+{
+	nvlist_t *innvl, *outnvl = NULL;
+	int error;
+
+	VERIFY0(nvlist_alloc(&innvl, NV_UNIQUE_NAME, 0));
+	fnvlist_add_uint64(innvl, "state", state);
+	if (timeout >= 0)
+		VERIFY0(nvlist_add_hrtime(innvl, "timeout", timeout));
+
+	do {
+		nvlist_free(outnvl);
+		error = lzc_wait_inject(innvl, &outnvl);
+	} while (error == EINTR);
+
+	if (nvlist_lookup_uint64(outnvl, "state", &state) == 0)
+		(void) printf("%"PRIu64"\n", state);
+
+	nvlist_free(outnvl);
+
+	return (error == 0 ? 0 : 1);
+}
+
+/*
  * Register a new fault injection handler.
  */
 static int
@@ -951,6 +991,8 @@ main(int argc, char **argv)
 	int flags = 0;
 	uint32_t dvas = 0;
 	hrtime_t ready_delay = -1;
+	char *wait = NULL;
+	hrtime_t wait_timeout = -1;
 
 	if ((g_zfs = libzfs_init()) == NULL) {
 		(void) fprintf(stderr, "%s\n", libzfs_error_init(errno));
@@ -981,7 +1023,7 @@ main(int argc, char **argv)
 	}
 
 	while ((c = getopt(argc, argv,
-	    ":aA:b:C:d:D:E:f:Fg:qhIc:t:T:l:mr:s:e:uL:p:P:")) != -1) {
+	    ":aA:b:C:d:D:E:f:Fg:qhIc:t:T:l:mr:s:e:uL:p:P:w:W:")) != -1) {
 		switch (c) {
 		case 'a':
 			flags |= ZINJECT_FLUSH_ARC;
@@ -1154,6 +1196,9 @@ main(int argc, char **argv)
 		case 'u':
 			flags |= ZINJECT_UNLOAD_SPA;
 			break;
+		case 'w':
+			wait = optarg;
+			break;
 		case 'E':
 			ret = parse_duration(optarg, &ready_delay);
 			if (ret != 0) {
@@ -1171,6 +1216,16 @@ main(int argc, char **argv)
 			    !LABEL_TYPE(type)) {
 				(void) fprintf(stderr, "invalid label type "
 				    "'%s'\n", optarg);
+				usage();
+				libzfs_fini(g_zfs);
+				return (1);
+			}
+			break;
+		case 'W':
+			ret = parse_duration(optarg, &wait_timeout);
+			if (ret != 0 || wait_timeout > INT32_MAX) {
+				(void) fprintf(stderr, "invalid timeout '%s': "
+				    "must be a positive duration\n", optarg);
 				usage();
 				libzfs_fini(g_zfs);
 				return (1);
@@ -1197,15 +1252,32 @@ main(int argc, char **argv)
 	if (record.zi_duration != 0 && record.zi_cmd == 0)
 		record.zi_cmd = ZINJECT_IGNORED_WRITES;
 
-	if (cancel != NULL) {
-		/*
-		 * '-c' is invalid with any other options.
-		 */
-		if (raw != NULL || range != NULL || type != TYPE_INVAL ||
-		    level != 0 || record.zi_cmd != ZINJECT_UNINITIALIZED ||
-		    record.zi_freq > 0 || dvas != 0 || ready_delay >= 0) {
+	/*
+	 * '-c' and '-w' are invalid with any other options.
+	 */
+	if (raw != NULL || range != NULL || type != TYPE_INVAL ||
+	    level != 0 || record.zi_cmd != ZINJECT_UNINITIALIZED ||
+	    record.zi_freq > 0 || dvas != 0 || ready_delay >= 0) {
+		if (cancel != NULL) {
 			(void) fprintf(stderr, "cancel (-c) incompatible with "
 			    "any other options\n");
+			usage();
+			libzfs_fini(g_zfs);
+			return (2);
+		}
+		if (wait != NULL) {
+			(void) fprintf(stderr, "wait (-w) incompatible with "
+			    "any other options\n");
+			usage();
+			libzfs_fini(g_zfs);
+			return (2);
+		}
+	}
+
+	if (cancel != NULL) {
+		if (wait != NULL) {
+			(void) fprintf(stderr, "cancel (-c) incompatible with "
+			    "wait (-w) option\n");
 			usage();
 			libzfs_fini(g_zfs);
 			return (2);
@@ -1230,6 +1302,25 @@ main(int argc, char **argv)
 			}
 			return (cancel_handler(id));
 		}
+	}
+
+	if (wait != NULL) {
+		uint64_t state;
+		if (argc != 0) {
+			(void) fprintf(stderr, "extraneous argument to '-w'\n");
+			usage();
+			libzfs_fini(g_zfs);
+			return (2);
+		}
+		state = (uint64_t)strtoull(wait, &end, 10);
+		if (*end != 0) {
+			(void) fprintf(stderr, "invalid state '%s': "
+			    "must be a positive integer\n", wait);
+			usage();
+			libzfs_fini(g_zfs);
+			return (1);
+		}
+		return (wait_inject(state, wait_timeout));
 	}
 
 	if (device != NULL) {

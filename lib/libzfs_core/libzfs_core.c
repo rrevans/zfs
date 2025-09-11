@@ -1994,3 +1994,12 @@ lzc_ddt_prune(const char *pool, zpool_ddt_prune_unit_t unit, uint64_t amount)
 
 	return (error);
 }
+
+/*
+ * Wait for injection events
+ */
+int
+lzc_wait_inject(nvlist_t *innvl, nvlist_t **outnvl)
+{
+	return (lzc_ioctl(ZFS_IOC_WAIT_INJECT, NULL, innvl, outnvl));
+}
