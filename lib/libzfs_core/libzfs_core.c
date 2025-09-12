@@ -2005,6 +2005,35 @@ lzc_wait_inject(nvlist_t *innvl, nvlist_t **outnvl)
 }
 
 /*
+ * Call dnode_next_offset for debugging
+ */
+int
+lzc_next_offset(const char *pool, uint64_t objset, uint64_t object, int flags,
+    uint64_t *offset, int minlvl, uint64_t blkfill, uint64_t txg)
+{
+	int error;
+	nvlist_t *args = fnvlist_alloc();
+	nvlist_t *result = NULL;
+
+	fnvlist_add_uint64(args, "objset", objset);
+	fnvlist_add_uint64(args, "object", object);
+	fnvlist_add_uint64(args, "flags", flags);
+	fnvlist_add_uint64(args, "offset", *offset);
+	fnvlist_add_int32(args, "minlvl", minlvl);
+	fnvlist_add_uint64(args, "blkfill", blkfill);
+	fnvlist_add_uint64(args, "txg", txg);
+
+	error = lzc_ioctl(ZFS_IOC_NEXT_OFFSET, pool, args, &result);
+
+	(void) nvlist_lookup_uint64(result, "offset", offset);
+
+	fnvlist_free(args);
+	fnvlist_free(result);
+
+	return (error);
+}
+
+/*
  * Find next object or hole in dataset's meta dnode
  */
 int

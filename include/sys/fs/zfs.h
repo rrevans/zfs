@@ -1564,6 +1564,7 @@ typedef enum zfs_ioc {
 	ZFS_IOC_DDT_PRUNE,			/* 0x5a59 */
 	ZFS_IOC_WAIT_INJECT,			/* 0x5a5a */
 	ZFS_IOC_NEXT_OBJ_TXG,			/* 0x5a5b */
+	ZFS_IOC_NEXT_OFFSET,			/* 0x5a5c */
 
 	/*
 	 * Per-platform (Optional) - 8/128 numbers reserved.

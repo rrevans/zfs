@@ -6116,6 +6116,104 @@ zfs_ioc_wait_inject(const char *name, nvlist_t *innvl, nvlist_t *outnvl)
 	return (error);
 }
 
+/*
+ * Call dnode_next_offset directly on an object for debugging
+ * innvl: {
+ *   "objset": object set
+ *   "object": object number
+ *   "flags": flags for search
+ *   "offset": input offset
+ *   "minlvl": lowest search level
+ *   "blkfill": desired block fill
+ *   "txg": find blocks created after given txg
+ * }
+ * outnvl: {
+ *   "offset": output offset
+ * }
+ */
+static const zfs_ioc_key_t zfs_keys_next_offset[] = {
+	{"objset",	DATA_TYPE_UINT64,	0},
+	{"object",	DATA_TYPE_UINT64,	0},
+	{"flags",	DATA_TYPE_UINT64,	0},
+	{"offset",	DATA_TYPE_UINT64,	0},
+	{"minlvl",	DATA_TYPE_INT32,	0},
+	{"blkfill",	DATA_TYPE_UINT64,	0},
+	{"txg",		DATA_TYPE_UINT64,	0},
+};
+
+static int
+zfs_ioc_next_offset(const char *pool, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	dsl_pool_t *dp;
+	dsl_dataset_t *ds;
+	objset_t *os;
+	dnode_t *dn;
+	uint64_t objset;
+	uint64_t object;
+	uint64_t flags;
+	uint64_t offset;
+	int minlvl;
+	uint64_t blkfill;
+	uint64_t txg;
+	int error;
+
+	objset = fnvlist_lookup_uint64(innvl, "objset");
+	object = fnvlist_lookup_uint64(innvl, "object");
+	flags = fnvlist_lookup_uint64(innvl, "flags");
+	offset = fnvlist_lookup_uint64(innvl, "offset");
+	minlvl = (int)fnvlist_lookup_int32(innvl, "minlvl");
+	blkfill = fnvlist_lookup_uint64(innvl, "blkfill");
+	txg = fnvlist_lookup_uint64(innvl, "txg");
+
+	if (flags & ~(DNODE_FIND_HOLE | DNODE_FIND_BACKWARDS))
+		return (EINVAL);
+	if (minlvl < 0 || (minlvl == 0 && object != 0))
+		return (EINVAL);
+	if (minlvl == 0 && (flags & DNODE_FIND_BACKWARDS))
+		return (EINVAL);
+
+	error = dsl_pool_hold(pool, FTAG, &dp);
+	if (error)
+		return (error);
+
+	if (objset == DMU_META_OBJSET) {
+		os = dp->dp_meta_objset;
+	} else {
+		error = dsl_dataset_hold_obj(dp, objset, FTAG, &ds);
+		if (error) {
+			dsl_pool_rele(dp, FTAG);
+			return (error);
+		}
+		error = dmu_objset_from_ds(ds, &os);
+		if (error) {
+			dsl_dataset_rele(ds, FTAG);
+			return (error);
+		}
+	}
+
+	if (object == DMU_META_DNODE_OBJECT) {
+		dn = DMU_META_DNODE(os);
+	} else {
+		error = dnode_hold(os, object, FTAG, &dn);
+		if (error) {
+			if (objset != DMU_META_OBJSET)
+				dsl_dataset_rele(ds, FTAG);
+			dsl_pool_rele(dp, FTAG);
+			return (error);
+		}
+	}
+
+	error = dnode_next_offset(dn, flags, &offset, minlvl, blkfill, txg);
+	if (object != DMU_META_DNODE_OBJECT)
+		dnode_rele(dn, FTAG);
+	if (objset != DMU_META_OBJSET)
+		dsl_dataset_rele(ds, FTAG);
+	dsl_pool_rele(dp, FTAG);
+
+	fnvlist_add_uint64(outnvl, "offset", offset);
+	return (error);
+}
+
 static int
 zfs_ioc_error_log(zfs_cmd_t *zc)
 {
@@ -7755,6 +7853,10 @@ zfs_ioctl_init(void)
 	    zfs_ioc_wait_inject, zfs_secpolicy_inject,
 	    NO_NAME, POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
 	    zfs_keys_wait_inject, ARRAY_SIZE(zfs_keys_wait_inject));
+	zfs_ioctl_register("next_offset", ZFS_IOC_NEXT_OFFSET,
+	    zfs_ioc_next_offset, zfs_secpolicy_inject, POOL_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE, zfs_keys_next_offset,
+	    ARRAY_SIZE(zfs_keys_next_offset));
 
 	/*
 	 * pool destroy, and export don't log the history as part of
