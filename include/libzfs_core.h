@@ -167,6 +167,8 @@ _LIBZFS_CORE_H int lzc_ddt_prune(const char *, zpool_ddt_prune_unit_t,
 
 _LIBZFS_CORE_H int lzc_wait_inject(nvlist_t *, nvlist_t **);
 
+_LIBZFS_CORE_H int lzc_next_obj(const char *, uint64_t *, boolean_t, uint64_t);
+
 #ifdef	__cplusplus
 }
 #endif

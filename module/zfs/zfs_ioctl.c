@@ -6564,6 +6564,48 @@ zfs_ioc_next_obj(zfs_cmd_t *zc)
 }
 
 /*
+ * innvl: {
+ *   "object": object number beyond which we want next object or hole
+ *   "hole": if true, find holes instead of objects
+ *   "txg": find objects modified or created after given txg
+ * }
+ * outnvl: {
+ *   "object": object number of next in-use object
+ * }
+ */
+static const zfs_ioc_key_t zfs_keys_next_obj_txg[] = {
+	{"object",	DATA_TYPE_UINT64,		0},
+	{"hole",	DATA_TYPE_BOOLEAN_VALUE,	0},
+	{"txg",		DATA_TYPE_UINT64,		0},
+};
+
+static int
+zfs_ioc_next_obj_txg(const char *name, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	objset_t *os;
+	uint64_t object;
+	boolean_t hole;
+	uint64_t txg;
+	int error;
+
+	object = fnvlist_lookup_uint64(innvl, "object");
+	hole = fnvlist_lookup_boolean_value(innvl, "hole");
+	txg = fnvlist_lookup_uint64(innvl, "txg");
+	if (hole && txg)
+		return (EINVAL);
+
+	error = dmu_objset_hold(name, FTAG, &os);
+	if (error != 0)
+		return (error);
+
+	error = dmu_object_next(os, &object, hole, txg);
+	fnvlist_add_uint64(outnvl, "object", object);
+
+	dmu_objset_rele(os, FTAG);
+	return (error);
+}
+
+/*
  * inputs:
  * zc_name		name of filesystem
  * zc_value		prefix name for snapshot
@@ -7748,6 +7790,10 @@ zfs_ioctl_init(void)
 	    zfs_ioc_objset_recvd_props);
 	zfs_ioctl_register_dataset_read(ZFS_IOC_NEXT_OBJ,
 	    zfs_ioc_next_obj);
+	zfs_ioctl_register("next_obj_txg", ZFS_IOC_NEXT_OBJ_TXG,
+	    zfs_ioc_next_obj_txg, zfs_secpolicy_read, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE, zfs_keys_next_obj_txg,
+	    ARRAY_SIZE(zfs_keys_next_obj_txg));
 	zfs_ioctl_register_dataset_read(ZFS_IOC_GET_FSACL,
 	    zfs_ioc_get_fsacl);
 	zfs_ioctl_register_dataset_read(ZFS_IOC_OBJSET_STATS,

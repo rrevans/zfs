@@ -2003,3 +2003,27 @@ lzc_wait_inject(nvlist_t *innvl, nvlist_t **outnvl)
 {
 	return (lzc_ioctl(ZFS_IOC_WAIT_INJECT, NULL, innvl, outnvl));
 }
+
+/*
+ * Find next object or hole in dataset's meta dnode
+ */
+int
+lzc_next_obj(const char *name, uint64_t *object, boolean_t hole, uint64_t txg)
+{
+	int error;
+	nvlist_t *args = fnvlist_alloc();
+	nvlist_t *result = NULL;
+
+	fnvlist_add_uint64(args, "object", *object);
+	fnvlist_add_boolean_value(args, "hole", hole);
+	fnvlist_add_uint64(args, "txg", txg);
+
+	error = lzc_ioctl(ZFS_IOC_NEXT_OBJ_TXG, name, args, &result);
+
+	(void) nvlist_lookup_uint64(result, "object", object);
+
+	fnvlist_free(args);
+	fnvlist_free(result);
+
+	return (error);
+}
